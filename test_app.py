@@ -3,112 +3,158 @@ test_app.py
 -----------
 Pruebas unitarias de la Entrega 2 (Integracion Continua).
 
-Objetivo: validar automaticamente los 2 endpoints + la seguridad por token,
+Objetivo: validar automaticamente los endpoints + la seguridad por token,
 SIN depender de PostgreSQL. Para eso usamos:
 
-  - El TEST CLIENT de Flask: un cliente HTTP "falso" que llama a la app en
-    memoria (sin levantar un servidor real ni abrir puertos).
-  - SQLite EN MEMORIA ("sqlite:///:memory:"): una base de datos que vive solo
-    durante la prueba y desaparece al terminar. Asi cada corrida arranca limpia
-    y no necesitamos RDS.
+  - El TEST CLIENT de Flask: llama a la app en memoria (sin servidor ni puertos).
+  - SQLite EN MEMORIA ("sqlite:///:memory:"): la base vive solo durante la
+    prueba. Se inyecta via create_app(config_overrides) ANTES de db.init_app(),
+    porque Flask-SQLAlchemy 3.x ignora cambios de URI hechos despues.
 
-Se corre con:  pytest -v
+Cobertura por endpoint:
+  GET  /                    -> health
+  POST /blacklists          -> exito, auth (sin token / token invalido), validaciones
+  GET  /blacklists/<email>  -> bloqueado, no bloqueado, auth
+
+Se corre con:  python -m pytest -v
 """
 import pytest
 
 from application import create_app
-from models import db
+from models import db, Blacklist
 
 
-# Token valido (debe coincidir con STATIC_BEARER_TOKEN de config.py).
-TOKEN = "token-secreto-entrega-1-2026"
-# Cabecera de autorizacion lista para reutilizar en las pruebas.
-AUTH = {"Authorization": f"Bearer {TOKEN}"}
+TEST_CONFIG = {
+    "TESTING": True,
+    "SQLALCHEMY_DATABASE_URI": "sqlite:///:memory:",
+}
 
 
 @pytest.fixture
-def client():
-    """
-    FIXTURE de pytest.
-
-    Una "fixture" prepara lo que la prueba necesita y lo entrega. pytest la
-    inyecta automaticamente en cualquier prueba que reciba un parametro
-    llamado 'client'.
-
-    Aqui:
-      1. Creamos la app.
-      2. La reconfiguramos para usar SQLite EN MEMORIA (en vez del archivo
-         blacklist.db), asi las pruebas no tocan datos reales.
-      3. Creamos las tablas en esa base temporal.
-      4. Entregamos (yield) el test client a la prueba.
-      5. Al terminar, limpiamos las tablas.
-    """
-    app = create_app()
-    app.config["TESTING"] = True
-    app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///:memory:"
-
+def app():
+    """App aislada con SQLite en memoria; tablas limpias en cada prueba."""
+    app = create_app(TEST_CONFIG)
     with app.app_context():
-        db.create_all()          # crea la tabla 'blacklist' en memoria
-        with app.test_client() as c:
-            yield c              # <-- aqui corre cada prueba
+        db.create_all()
+        yield app
         db.session.remove()
-        db.drop_all()            # limpia al terminar
+        db.drop_all()
 
 
-# --- Prueba 1: POST con token valido -> 201 (creado) ---
-def test_post_blacklist_con_token_ok(client):
-    """Con token y datos correctos, el email se agrega (201)."""
+@pytest.fixture
+def client(app):
+    return app.test_client()
+
+
+@pytest.fixture
+def auth(app):
+    """
+    Cabecera valida tomada de la config real de la app (no hardcodeada).
+    Si CodeBuild define STATIC_BEARER_TOKEN, las pruebas siguen funcionando.
+    """
+    return {"Authorization": f"Bearer {app.config['STATIC_BEARER_TOKEN']}"}
+
+
+# ---------------------------------------------------------------------------
+# Guardia de aislamiento: si alguien rompe el override, esta prueba falla
+# antes de que las demas escriban en un archivo .db o en RDS.
+# ---------------------------------------------------------------------------
+def test_usa_sqlite_en_memoria(app):
+    url = db.engine.url
+    assert url.drivername == "sqlite"
+    assert url.database in (None, "", ":memory:")
+
+
+# ---------------------------------------------------------------------------
+# GET /  (health check)
+# ---------------------------------------------------------------------------
+def test_health_ok(client):
+    """El health check responde 200 y no requiere token."""
+    resp = client.get("/")
+    assert resp.status_code == 200
+    assert resp.get_json()["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# POST /blacklists
+# ---------------------------------------------------------------------------
+def test_post_blacklist_con_token_ok(client, auth, app):
+    """Con token y datos correctos: 201 y el registro queda persistido con IP y fecha."""
     resp = client.post(
         "/blacklists",
-        json={"email": "malo@test.com", "app_uuid": "app-123"},
-        headers=AUTH,
+        json={"email": "malo@test.com", "app_uuid": "app-123",
+              "blocked_reason": "fraude"},
+        headers=auth,
     )
     assert resp.status_code == 201
-    # El cuerpo de respuesta confirma el email agregado.
     assert resp.get_json()["email"] == "malo@test.com"
 
+    registro = Blacklist.query.filter_by(email="malo@test.com").first()
+    assert registro is not None
+    assert registro.app_uuid == "app-123"
+    assert registro.ip_address is not None      # el servicio guarda la IP
+    assert registro.created_at is not None      # y la fecha/hora
 
-# --- Prueba 2: POST sin token -> 401 (no autorizado) ---
+
 def test_post_blacklist_sin_token_401(client):
-    """Sin cabecera Authorization, el endpoint debe rechazar con 401."""
     resp = client.post(
         "/blacklists",
         json={"email": "malo@test.com", "app_uuid": "app-123"},
-        # Ojo: NO mandamos headers=AUTH a proposito.
     )
     assert resp.status_code == 401
 
 
-# --- Prueba 3: GET de un email que SI esta bloqueado -> blacklisted: true ---
-def test_get_blacklist_bloqueado_true(client):
-    """
-    Primero agregamos el email (POST), luego lo consultamos (GET).
-    Como existe, la respuesta debe decir blacklisted: true.
-    """
+def test_post_blacklist_token_invalido_401(client):
+    resp = client.post(
+        "/blacklists",
+        json={"email": "malo@test.com", "app_uuid": "app-123"},
+        headers={"Authorization": "Bearer token-falso"},
+    )
+    assert resp.status_code == 401
+
+
+@pytest.mark.parametrize("payload", [
+    {"app_uuid": "app-123"},                       # falta email
+    {"email": "malo@test.com"},                    # falta app_uuid
+    {"email": "malo@test.com", "app_uuid": "app-123",
+     "blocked_reason": "x" * 256},                 # motivo > 255
+])
+def test_post_blacklist_validaciones_400(client, auth, payload):
+    resp = client.post("/blacklists", json=payload, headers=auth)
+    assert resp.status_code == 400
+
+
+def test_post_blacklist_body_no_json_400(client, auth):
+    resp = client.post("/blacklists", data="no-es-json",
+                       content_type="text/plain", headers=auth)
+    assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# GET /blacklists/<email>
+# ---------------------------------------------------------------------------
+def test_get_blacklist_bloqueado_true(client, auth):
     client.post(
         "/blacklists",
         json={"email": "bloqueado@test.com", "app_uuid": "app-123",
               "blocked_reason": "fraude"},
-        headers=AUTH,
+        headers=auth,
     )
-    resp = client.get("/blacklists/bloqueado@test.com", headers=AUTH)
+    resp = client.get("/blacklists/bloqueado@test.com", headers=auth)
     assert resp.status_code == 200
     data = resp.get_json()
     assert data["blacklisted"] is True
     assert data["blocked_reason"] == "fraude"
 
 
-# --- Prueba 4: GET de un email que NO esta bloqueado -> blacklisted: false ---
-def test_get_blacklist_no_bloqueado_false(client):
-    """Un email que nunca se agrego debe devolver blacklisted: false."""
-    resp = client.get("/blacklists/inexistente@test.com", headers=AUTH)
+def test_get_blacklist_no_bloqueado_false(client, auth):
+    resp = client.get("/blacklists/inexistente@test.com", headers=auth)
     assert resp.status_code == 200
-    assert resp.get_json()["blacklisted"] is False
+    data = resp.get_json()
+    assert data["blacklisted"] is False
+    assert data["blocked_reason"] is None
 
 
-# --- Prueba 5: GET / (health check) -> 200 ---
-def test_health_ok(client):
-    """El endpoint de salud responde 200 y no requiere token."""
-    resp = client.get("/")
-    assert resp.status_code == 200
-    assert resp.get_json()["status"] == "ok"
+def test_get_blacklist_sin_token_401(client):
+    resp = client.get("/blacklists/cualquiera@test.com")
+    assert resp.status_code == 401

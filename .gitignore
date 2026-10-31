@@ -15,5 +15,9 @@ __pycache__/
 .idea/
 .vscode/
 
+# Pruebas / CI
+.pytest_cache/
+reports/
+
 # Paquetes de despliegue
 *.zip

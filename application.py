@@ -20,13 +20,23 @@ from schemas import ma
 from resources import BlacklistResource, BlacklistCheckResource
 
 
-def create_app():
-    """Crea y configura la instancia de Flask (patron 'application factory')."""
+def create_app(config_overrides=None):
+    """
+    Crea y configura la instancia de Flask (patron 'application factory').
+
+    config_overrides (dict, opcional): valores que reemplazan la config ANTES
+    de enlazar las extensiones. Lo usan las pruebas para forzar SQLite en
+    memoria. Es obligatorio aplicarlo antes de db.init_app(): Flask-SQLAlchemy
+    3.x lee la config una sola vez en init_app() y crea el engine ahi; cambiar
+    SQLALCHEMY_DATABASE_URI despues no tiene efecto.
+    """
     app = Flask(__name__)
 
     # 1. Cargar configuracion (token, JWT) y la URI de base de datos.
     app.config.from_object(Config)
     app.config["SQLALCHEMY_DATABASE_URI"] = Config.get_database_uri()
+    if config_overrides:
+        app.config.update(config_overrides)
 
     # 2. Enlazar las extensiones con la app.
     db.init_app(app)
