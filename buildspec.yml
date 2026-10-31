@@ -32,15 +32,15 @@ phases:
 
   pre_build:
     commands:
-      - echo "== PRE_BUILD: instalando dependencias =="
+      - 'echo "== PRE_BUILD: instalando dependencias =="'
       - pip install -r requirements-dev.txt
 
   build:
     commands:
-      - echo "== BUILD: pruebas unitarias =="
+      - 'echo "== BUILD: pruebas unitarias =="'
       - mkdir -p reports
       - python -m pytest -v --junitxml=reports/junit.xml
-      - echo "== BUILD: empaquetando artefacto desplegable =="
+      - 'echo "== BUILD: empaquetando artefacto desplegable =="'
       - zip -r app.zip application.py config.py models.py schemas.py resources.py requirements.txt .ebextensions
       - unzip -l app.zip
       - aws s3 cp app.zip "s3://${ARTIFACT_BUCKET}/builds/app-${CODEBUILD_RESOLVED_SOURCE_VERSION}.zip"
@@ -48,7 +48,7 @@ phases:
   post_build:
     commands:
       # CODEBUILD_BUILD_SUCCEEDING = 1 si todo va bien, 0 si una fase fallo.
-      - echo "== POST_BUILD: CODEBUILD_BUILD_SUCCEEDING=$CODEBUILD_BUILD_SUCCEEDING =="
+      - 'echo "== POST_BUILD: CODEBUILD_BUILD_SUCCEEDING=$CODEBUILD_BUILD_SUCCEEDING =="'
       - echo "Commit fuente = $CODEBUILD_RESOLVED_SOURCE_VERSION"
 
 reports:
