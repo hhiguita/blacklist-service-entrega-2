@@ -55,7 +55,7 @@ class Config:
         if db_host and db_name and db_user:
             # Entorno AWS: conexion a PostgreSQL
             return (
-                f"postgresql://{db_user}:{db_pass}"
+                f"postgresql+psycopg2://{db_user}:{db_pass}"
                 f"@{db_host}:{db_port}/{db_name}"
             )
 

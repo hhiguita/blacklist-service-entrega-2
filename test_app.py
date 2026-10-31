@@ -22,6 +22,7 @@ import pytest
 
 from application import create_app
 from models import db, Blacklist
+from config import Config
 
 
 TEST_CONFIG = {
@@ -170,3 +171,14 @@ def test_get_blacklist_no_bloqueado_false(client, auth):
 def test_get_blacklist_sin_token_401(client):
     resp = client.get("/blacklists/cualquiera@test.com")
     assert resp.status_code == 401
+
+
+def test_uri_postgres_usa_driver_psycopg2(monkeypatch):
+    """SQLAlchemy 2.1 usa psycopg3 por defecto con 'postgresql://'; debemos fijar psycopg2."""
+    monkeypatch.setenv("RDS_HOSTNAME", "db.ejemplo.internal")
+    monkeypatch.setenv("RDS_DB_NAME", "ebdb")
+    monkeypatch.setenv("RDS_USERNAME", "usuario")
+    monkeypatch.setenv("RDS_PASSWORD", "clave")
+    monkeypatch.setenv("RDS_PORT", "5432")
+    assert Config.get_database_uri().startswith("postgresql+psycopg2://")
+    import psycopg2  # noqa: F401  (el driver debe estar instalado)
