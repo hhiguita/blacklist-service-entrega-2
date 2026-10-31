@@ -1,0 +1,236 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Entrega 2 DevOps: Blacklist Service en Elastic Beanstalk (Single Instance, Python 3.12 AL2023)
+  + PostgreSQL en RDS (credenciales en Secrets Manager). El codigo sale del artefacto que genera
+  el CI (builds/app-<commit>.zip). Despliegue MANUAL actualizando este stack: no hay CD.
+
+Parameters:
+  ApplicationName:
+    Type: String
+    Default: blacklist-service
+  EnvironmentName:
+    Type: String
+    Default: blacklist-service-env
+    AllowedPattern: "[a-zA-Z0-9][a-zA-Z0-9-]{2,38}[a-zA-Z0-9]"
+  SolutionStackName:
+    Type: String
+    Description: >-
+      Ej. "64bit Amazon Linux 2023 v4.x.y running Python 3.12". deploy-app.sh resuelve la vigente.
+      Debe ser Python 3.12: psycopg2-binary==2.9.9 no instala en 3.13+.
+    AllowedPattern: ".*Python 3\\.12.*"
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subredes publicas en al menos 2 AZ (RDS lo exige).
+  SourceBundleBucket:
+    Type: String
+    Description: Bucket de artefactos del stack de CI (output ArtifactBucketName).
+  SourceBundleKey:
+    Type: String
+    Description: Ruta del artefacto, ej. builds/app-<commit>.zip
+  StaticBearerToken:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+  JwtSecretKey:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+  InstanceType:
+    Type: String
+    Default: t3.micro
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+  DBEngineVersion:
+    Type: String
+    Default: "16"
+
+Resources:
+  # ------------------------------ IAM ------------------------------
+  EBServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: elasticbeanstalk.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSElasticBeanstalkEnhancedHealth"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AWSElasticBeanstalkManagedUpdatesCustomerRolePolicy"
+
+  EBInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AWSElasticBeanstalkWebTier"
+
+  EBInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EBInstanceRole
+
+  # ------------------------------ Red ------------------------------
+  # Identifica a la instancia ante RDS. El puerto 80 lo abre el SG que crea Beanstalk.
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Instancia EC2 de blacklist-service
+      VpcId: !Ref VpcId
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: PostgreSQL de blacklist-service (solo desde la app)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+
+  # ------------------------------ RDS ------------------------------
+  DBSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Credenciales PostgreSQL de blacklist-service
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "blacklist_admin"}'
+        GenerateStringKey: password
+        PasswordLength: 24
+        ExcludePunctuation: true
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subredes de blacklist-service
+      SubnetIds: !Ref SubnetIds
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    # Proyecto academico: se borra sin snapshot para quedar en costo cero.
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Engine: postgres
+      EngineVersion: !Ref DBEngineVersion
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: "20"
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: ebdb
+      MasterUsername: !Sub "{{resolve:secretsmanager:${DBSecret}:SecretString:username}}"
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DBSecret}:SecretString:password}}"
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DBSecurityGroup
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 0
+      DeletionProtection: false
+
+  # -------------------------- Beanstalk --------------------------
+  EBApplication:
+    Type: AWS::ElasticBeanstalk::Application
+    Properties:
+      ApplicationName: !Ref ApplicationName
+      Description: Microservicio lista negra de emails
+
+  # Cambiar SourceBundleKey reemplaza la version y Beanstalk la despliega (manual, via IaC).
+  EBApplicationVersion:
+    Type: AWS::ElasticBeanstalk::ApplicationVersion
+    Properties:
+      ApplicationName: !Ref EBApplication
+      Description: !Sub "Artefacto CI s3://${SourceBundleBucket}/${SourceBundleKey}"
+      SourceBundle:
+        S3Bucket: !Ref SourceBundleBucket
+        S3Key: !Ref SourceBundleKey
+
+  EBEnvironment:
+    Type: AWS::ElasticBeanstalk::Environment
+    Properties:
+      ApplicationName: !Ref EBApplication
+      EnvironmentName: !Ref EnvironmentName
+      SolutionStackName: !Ref SolutionStackName
+      VersionLabel: !Ref EBApplicationVersion
+      Tier:
+        Name: WebServer
+        Type: Standard
+      OptionSettings:
+        - Namespace: aws:elasticbeanstalk:environment
+          OptionName: EnvironmentType
+          Value: SingleInstance
+        - Namespace: aws:elasticbeanstalk:environment
+          OptionName: ServiceRole
+          Value: !Ref EBServiceRole
+        - Namespace: aws:elasticbeanstalk:healthreporting:system
+          OptionName: SystemType
+          Value: enhanced
+        - Namespace: aws:autoscaling:launchconfiguration
+          OptionName: IamInstanceProfile
+          Value: !Ref EBInstanceProfile
+        - Namespace: aws:autoscaling:launchconfiguration
+          OptionName: SecurityGroups
+          Value: !Ref AppSecurityGroup
+        - Namespace: aws:autoscaling:launchconfiguration
+          OptionName: DisableIMDSv1
+          Value: "true"
+        - Namespace: aws:ec2:instances
+          OptionName: InstanceTypes
+          Value: !Ref InstanceType
+        - Namespace: aws:ec2:vpc
+          OptionName: VPCId
+          Value: !Ref VpcId
+        - Namespace: aws:ec2:vpc
+          OptionName: Subnets
+          Value: !Join [",", !Ref SubnetIds]
+        - Namespace: aws:ec2:vpc
+          OptionName: AssociatePublicIpAddress
+          Value: "true"
+        # Variables que lee config.py
+        - Namespace: aws:elasticbeanstalk:application:environment
+          OptionName: STATIC_BEARER_TOKEN
+          Value: !Ref StaticBearerToken
+        - Namespace: aws:elasticbeanstalk:application:environment
+          OptionName: JWT_SECRET_KEY
+          Value: !Ref JwtSecretKey
+        - Namespace: aws:elasticbeanstalk:application:environment
+          OptionName: RDS_HOSTNAME
+          Value: !GetAtt Database.Endpoint.Address
+        - Namespace: aws:elasticbeanstalk:application:environment
+          OptionName: RDS_PORT
+          Value: !GetAtt Database.Endpoint.Port
+        - Namespace: aws:elasticbeanstalk:application:environment
+          OptionName: RDS_DB_NAME
+          Value: ebdb
+        - Namespace: aws:elasticbeanstalk:application:environment
+          OptionName: RDS_USERNAME
+          Value: !Sub "{{resolve:secretsmanager:${DBSecret}:SecretString:username}}"
+        # Trade-off: Beanstalk guarda este valor como propiedad de entorno (visible en su consola
+        # para quien tenga permisos). Aceptable en el curso; en produccion la app leeria el secreto.
+        - Namespace: aws:elasticbeanstalk:application:environment
+          OptionName: RDS_PASSWORD
+          Value: !Sub "{{resolve:secretsmanager:${DBSecret}:SecretString:password}}"
+
+Outputs:
+  EnvironmentURL:
+    Description: base_url para Postman
+    Value: !Sub "http://${EBEnvironment.EndpointURL}"
+  DeployedArtifact:
+    Value: !Sub "s3://${SourceBundleBucket}/${SourceBundleKey}"
+  DatabaseEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+  DBSecretArn:
+    Value: !Ref DBSecret

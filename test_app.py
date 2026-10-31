@@ -11,9 +11,9 @@ SIN depender de PostgreSQL. Para eso usamos:
     prueba. Se inyecta via create_app(config_overrides) ANTES de db.init_app(),
     porque Flask-SQLAlchemy 3.x ignora cambios de URI hechos despues.
 
-Cobertura por endpoint:
+Cobertura por endpoint (13 casos):
   GET  /                    -> health
-  POST /blacklists          -> exito, auth (sin token / token invalido), validaciones
+  POST /blacklists          -> exito, IP real tras proxy, auth, validaciones
   GET  /blacklists/<email>  -> bloqueado, no bloqueado, auth
 
 Se corre con:  python -m pytest -v
@@ -94,6 +94,18 @@ def test_post_blacklist_con_token_ok(client, auth, app):
     assert registro.app_uuid == "app-123"
     assert registro.ip_address is not None      # el servicio guarda la IP
     assert registro.created_at is not None      # y la fecha/hora
+
+
+def test_post_blacklist_guarda_ip_real_detras_de_proxy(client, auth, app):
+    """Detras de nginx (Beanstalk) se debe guardar la IP del cliente, no la del proxy."""
+    resp = client.post(
+        "/blacklists",
+        json={"email": "proxy@test.com", "app_uuid": "app-123"},
+        headers={**auth, "X-Forwarded-For": "203.0.113.7"},
+    )
+    assert resp.status_code == 201
+    registro = Blacklist.query.filter_by(email="proxy@test.com").first()
+    assert registro.ip_address == "203.0.113.7"
 
 
 def test_post_blacklist_sin_token_401(client):

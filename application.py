@@ -11,6 +11,7 @@ Aqui "armamos" la app: cargamos la config, enlazamos la base de datos,
 Marshmallow y JWT, registramos los endpoints y creamos las tablas.
 """
 from flask import Flask, jsonify
+from werkzeug.middleware.proxy_fix import ProxyFix
 from flask_restful import Api
 from flask_jwt_extended import JWTManager
 
@@ -37,6 +38,11 @@ def create_app(config_overrides=None):
     app.config["SQLALCHEMY_DATABASE_URI"] = Config.get_database_uri()
     if config_overrides:
         app.config.update(config_overrides)
+
+    # 1b. Beanstalk pone nginx delante de la app: sin esto request.remote_addr
+    #     seria la IP del proxy (127.0.0.1) y no la del cliente. x_for=1 confia
+    #     solo en el ultimo salto (nginx). Con un ALB delante habria que usar 2.
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1)
 
     # 2. Enlazar las extensiones con la app.
     db.init_app(app)

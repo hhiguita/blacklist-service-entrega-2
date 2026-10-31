@@ -1,18 +1,18 @@
 # buildspec.yml
 # -------------
 # Guion que AWS CodeBuild ejecuta en CADA build (Entrega 2 - Integracion Continua).
+# El proyecto lo crea infra/ci-pipeline.yaml, que define ARTIFACT_BUCKET.
 #
-#   install     -> fija Python 3.12 (imagen Amazon Linux 2023 standard:5.0).
-#   pre_build   -> instala dependencias de la app + pytest.
-#   build       -> corre las pruebas. Si fallan, pytest sale con codigo != 0 y
-#                  el build queda FAILED (y la accion del pipeline en rojo).
-#   post_build  -> deja constancia del resultado. OJO: segun la doc de AWS
-#                  (Build phase transitions) post_build se ejecuta aunque build
-#                  falle, y UPLOAD_ARTIFACTS "siempre se intenta". Por eso aqui
-#                  no se empaqueta nada a mano.
-#   reports     -> publica el resultado de pytest (JUnit XML) en la pestana
-#                  "Reports" de CodeBuild: evidencia visual para el documento.
-#   artifacts   -> SOLO el codigo desplegable (sin tests, sin buildspec).
+#   install     -> Python 3.12 (imagen Amazon Linux 2023 standard:5.0).
+#   pre_build   -> dependencias de la app + pytest (requirements-dev.txt).
+#   build       -> 1) pruebas  2) zip desplegable  3) copia a S3 con el hash del commit.
+#                  Si pytest falla, la fase BUILD falla y los comandos siguientes de la
+#                  fase no se ejecutan: no se genera ni se copia app.zip.
+#   post_build  -> deja constancia del resultado. Segun la doc de AWS (Build phase
+#                  transitions) post_build corre aunque build falle y UPLOAD_ARTIFACTS
+#                  "siempre se intenta"; en un build fallido no hay app.zip que subir.
+#   reports     -> resultado de pytest (JUnit XML) en la pestana "Reports" de CodeBuild.
+#   artifacts   -> app.zip, salida que CodePipeline guarda en su bucket.
 #
 # Alcance Entrega 2: SOLO genera el artefacto (CI). NO despliega (eso es CD).
 
@@ -33,14 +33,17 @@ phases:
   pre_build:
     commands:
       - echo "== PRE_BUILD: instalando dependencias =="
-      - pip install -r requirements.txt
-      - pip install pytest==8.3.3        # solo para CI, no va en requirements.txt
+      - pip install -r requirements-dev.txt
 
   build:
     commands:
       - echo "== BUILD: pruebas unitarias =="
       - mkdir -p reports
       - python -m pytest -v --junitxml=reports/junit.xml
+      - echo "== BUILD: empaquetando artefacto desplegable =="
+      - zip -r app.zip application.py config.py models.py schemas.py resources.py requirements.txt .ebextensions
+      - unzip -l app.zip
+      - aws s3 cp app.zip "s3://${ARTIFACT_BUCKET}/builds/app-${CODEBUILD_RESOLVED_SOURCE_VERSION}.zip"
 
   post_build:
     commands:
@@ -55,13 +58,6 @@ reports:
       - junit.xml
     file-format: JUNITXML
 
-# Artefacto desplegable: lista BLANCA de lo que Beanstalk necesita.
 artifacts:
   files:
-    - application.py
-    - config.py
-    - models.py
-    - schemas.py
-    - resources.py
-    - requirements.txt
-    - .ebextensions/**/*
+    - app.zip
