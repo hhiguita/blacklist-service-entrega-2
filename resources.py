@@ -94,7 +94,7 @@ class BlacklistResource(Resource):
         return {
             "message": "Email agregado a la lista negra correctamente",
             "email": email,
-        }, 200
+        }, 201
 
 
 class BlacklistCheckResource(Resource):
