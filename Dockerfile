@@ -28,4 +28,4 @@ EXPOSE 5000
 # STATIC_BEARER_TOKEN, JWT_SECRET_KEY y RDS_* los inyecta la Task Definition de ECS.
 # --preload: application.py crea las tablas al importarse; con --preload ocurre una
 # sola vez en el proceso maestro y no en carrera entre los workers.
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", "--threads", "4", "--preload", "application:app_inexistente"]
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", "--threads", "4", "--preload", "application:application"]
