@@ -1,0 +1,339 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Entrega 3 DevOps (Fargate): cluster ECS, ALB con dos target groups (blue/green), servicio
+  Fargate controlado por CodeDeploy y aplicacion/grupo de despliegue de CodeDeploy.
+  Requiere base-stack.yaml y que ya exista una imagen en ECR con el tag ImageTag
+  (bootstrap-image.sh): corresponde al despliegue manual inicial del enunciado.
+  Desde ahi, cada despliegue lo hace el pipeline (ci-pipeline.yaml).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: blacklist-service
+    AllowedPattern: "[a-z0-9-]{3,24}"
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subredes publicas en al menos 2 AZ (ALB y tareas Fargate).
+  RepositoryName:
+    Type: String
+    Default: blacklist-service
+  ImageTag:
+    Type: String
+    Default: bootstrap
+    Description: Tag de la imagen inicial. Los siguientes despliegues los hace CodeDeploy.
+  DBHost:
+    Type: String
+  DBSecretArn:
+    Type: String
+  DBSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+  TokenSecretArn:
+    Type: String
+  JwtSecretArn:
+    Type: String
+  DesiredCount:
+    Type: Number
+    Default: 1
+
+Resources:
+  # ------------------------------ Red ------------------------------
+  # Puerto 8080 (listener de pruebas de blue/green) queda sin acceso externo:
+  # CodeDeploy no necesita llegar a el desde Internet.
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB de blacklist-service
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Tareas Fargate de blacklist-service (solo desde el ALB)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5000
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+
+  DBIngressFromTasks:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DBSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref TaskSecurityGroup
+
+  # ------------------------------ ALB ------------------------------
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${ProjectName}-alb"
+      Type: application
+      Scheme: internet-facing
+      Subnets: !Ref SubnetIds
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+
+  # Blue: recibe el trafico de produccion. Green: donde CodeDeploy levanta la version nueva.
+  TargetGroupBlue:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-blue"
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: 5000
+      TargetType: ip
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200"
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+
+  TargetGroupGreen:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-green"
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: 5000
+      TargetType: ip
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200"
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+
+  ProdListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroupBlue
+
+  TestListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 8080
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroupGreen
+
+  # ------------------------------ ECS ------------------------------
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${ProjectName}-cluster"
+
+  # Mismo nombre que "awslogs-group" en taskdef.json
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/ecs/${ProjectName}"
+      RetentionInDays: 14
+
+  # Rol que usa ECS para descargar la imagen, escribir logs y leer los secretos.
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+      Policies:
+        - PolicyName: read-app-secrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref DBSecretArn
+                  - !Ref TokenSecretArn
+                  - !Ref JwtSecretArn
+
+  # Rol de la aplicacion en ejecucion: no necesita llamar a ningun servicio de AWS.
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+
+  CodeDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AWSCodeDeployRoleForECS"
+
+  # Revision inicial. Despues CodeDeploy registra una nueva por cada despliegue
+  # a partir de taskdef.json (por eso el contenedor se llama igual en ambos).
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref ProjectName
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "512"
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: !Ref ProjectName
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${RepositoryName}:${ImageTag}"
+          Essential: true
+          PortMappings:
+            - ContainerPort: 5000
+              Protocol: tcp
+          Environment:
+            - Name: RDS_HOSTNAME
+              Value: !Ref DBHost
+            - Name: RDS_PORT
+              Value: "5432"
+            - Name: RDS_DB_NAME
+              Value: blacklist
+          Secrets:
+            - Name: STATIC_BEARER_TOKEN
+              ValueFrom: !Ref TokenSecretArn
+            - Name: JWT_SECRET_KEY
+              ValueFrom: !Ref JwtSecretArn
+            - Name: RDS_USERNAME
+              ValueFrom: !Sub "${DBSecretArn}:username::"
+            - Name: RDS_PASSWORD
+              ValueFrom: !Sub "${DBSecretArn}:password::"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: api
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ProdListener
+      - TestListener
+    Properties:
+      ServiceName: !Sub "${ProjectName}-service"
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref TaskDefinition
+      # CodeDeploy controla los despliegues (blue/green). No modificar el servicio
+      # desde CloudFormation despues del primer despliegue: revertiria la task definition.
+      DeploymentController:
+        Type: CODE_DEPLOY
+      HealthCheckGracePeriodSeconds: 60
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref SubnetIds
+          SecurityGroups:
+            - !Ref TaskSecurityGroup
+      LoadBalancers:
+        - ContainerName: !Ref ProjectName
+          ContainerPort: 5000
+          TargetGroupArn: !Ref TargetGroupBlue
+
+  # ---------------------------- CodeDeploy ----------------------------
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Sub "${ProjectName}-cd"
+      ComputePlatform: ECS
+
+  DeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployApplication
+      DeploymentGroupName: !Sub "${ProjectName}-dg"
+      ServiceRoleArn: !GetAtt CodeDeployRole.Arn
+      DeploymentConfigName: CodeDeployDefault.ECSAllAtOnce
+      DeploymentStyle:
+        DeploymentType: BLUE_GREEN
+        DeploymentOption: WITH_TRAFFIC_CONTROL
+      # Si la version nueva no queda sana, vuelve a la anterior sin intervencion
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events:
+          - DEPLOYMENT_FAILURE
+      BlueGreenDeploymentConfiguration:
+        DeploymentReadyOption:
+          ActionOnTimeout: CONTINUE_DEPLOYMENT
+          WaitTimeInMinutes: 0
+        TerminateBlueInstancesOnDeploymentSuccess:
+          Action: TERMINATE
+          TerminationWaitTimeInMinutes: 1
+      ECSServices:
+        - ClusterName: !Ref Cluster
+          ServiceName: !GetAtt Service.Name
+      LoadBalancerInfo:
+        TargetGroupPairInfoList:
+          - TargetGroups:
+              - Name: !GetAtt TargetGroupBlue.TargetGroupName
+              - Name: !GetAtt TargetGroupGreen.TargetGroupName
+            ProdTrafficRoute:
+              ListenerArns:
+                - !Ref ProdListener
+            TestTrafficRoute:
+              ListenerArns:
+                - !Ref TestListener
+
+Outputs:
+  ApiUrl:
+    Description: base_url para Postman
+    Value: !Sub "http://${LoadBalancer.DNSName}"
+  ClusterName:
+    Value: !Ref Cluster
+  ServiceName:
+    Value: !GetAtt Service.Name
+  CodeDeployApplicationName:
+    Value: !Ref CodeDeployApplication
+  DeploymentGroupName:
+    Value: !Ref DeploymentGroup
+  TaskExecutionRoleArn:
+    Value: !GetAtt TaskExecutionRole.Arn
+  TaskRoleArn:
+    Value: !GetAtt TaskRole.Arn

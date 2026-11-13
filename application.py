@@ -39,9 +39,9 @@ def create_app(config_overrides=None):
     if config_overrides:
         app.config.update(config_overrides)
 
-    # 1b. Beanstalk pone nginx delante de la app: sin esto request.remote_addr
-    #     seria la IP del proxy (127.0.0.1) y no la del cliente. x_for=1 confia
-    #     solo en el ultimo salto (nginx). Con un ALB delante habria que usar 2.
+    # 1b. Detras de un proxy, request.remote_addr seria la IP del proxy y no la del
+    #     cliente. x_for=1 confia solo en el ultimo salto: en Beanstalk era nginx;
+    #     en Fargate es el ALB, que agrega la IP del cliente a X-Forwarded-For.
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1)
 
     # 2. Enlazar las extensiones con la app.

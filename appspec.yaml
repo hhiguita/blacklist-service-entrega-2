@@ -1,0 +1,11 @@
+version: 0.0
+Resources:
+  - TargetService:
+      Type: AWS::ECS::Service
+      Properties:
+        # CodeDeploy reemplaza <TASK_DEFINITION> por la revision que registra a partir de taskdef.json
+        TaskDefinition: <TASK_DEFINITION>
+        LoadBalancerInfo:
+          # Debe coincidir con el nombre del contenedor en taskdef.json y en el servicio ECS
+          ContainerName: "blacklist-service"
+          ContainerPort: 5000

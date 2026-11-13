@@ -2,7 +2,8 @@
 
 Microservicio REST desarrollado en Python + Flask para la gestión de una lista
 negra global de emails. Curso de DevOps: Entrega 1 (despliegue en AWS Elastic Beanstalk) y
-Entrega 2 (integracion continua con CodePipeline + CodeBuild, sin CD).
+Entrega 2 (integracion continua con CodePipeline + CodeBuild) y
+Entrega 3 (entrega continua: imagen en ECR y despliegue blue/green en AWS Fargate con CodeDeploy).
 
 ## Stack
 
@@ -87,24 +88,30 @@ python -m pytest -v
 | `GET /blacklists/<email>` | 200 bloqueado (true + motivo), 200 no bloqueado (false), 401 sin token |
 | (guardia) | Verifica que las pruebas usan SQLite en memoria |
 
-## Infraestructura como codigo (`infra/`)
+## Infraestructura como codigo (`infra/`) - Entrega 3: CI/CD sobre AWS Fargate
 
 | Archivo | Stack | Crea |
 |---|---|---|
-| `ci-pipeline.yaml` | `blacklist-ci` | Conexion GitHub, bucket de artefactos, CodeBuild, CodePipeline V2 (Source + Build, **sin Deploy**), roles IAM, logs y reportes |
-| `eb-app.yaml` | `blacklist-app` | Beanstalk Single Instance (Python 3.12 AL2023), RDS PostgreSQL, secreto en Secrets Manager, security groups, roles |
+| `base-stack.yaml` | `blacklist-base` | Repositorio ECR, PostgreSQL en RDS, secretos (token, JWT, base de datos) |
+| `fargate-stack.yaml` | `blacklist-fargate` | ALB con target groups blue/green, cluster ECS, servicio Fargate, aplicacion y grupo de CodeDeploy |
+| `ci-pipeline.yaml` | `blacklist-ci` | Conexion GitHub, CodeBuild, CodePipeline V2 (Source + Build + **Deploy**), roles IAM, logs y reportes |
+| `eb-app.yaml`, `deploy-app.sh` | `blacklist-app` | **Entrega 2 (legado):** Beanstalk + RDS con despliegue manual del zip. Ya no se usa. |
+
+Archivos del repo que usa el pipeline: `Dockerfile`, `buildspec.yml`, `taskdef.json`, `appspec.yaml`.
 
 ```bash
 cd infra
-./deploy-ci.sh <perfil> [arn-conexion]     # 1. CI; autorizar la conexion GitHub si queda PENDING
-# 2. push a master -> el pipeline genera s3://<bucket>/builds/app-<commit>.zip
-export STATIC_BEARER_TOKEN='...' JWT_SECRET_KEY='...'
-./deploy-app.sh <perfil> [commit-sha]      # 3. despliegue MANUAL del artefacto en Beanstalk
-./destroy.sh <perfil> [app|ci|all]         # borra todo
+export STATIC_BEARER_TOKEN='...' JWT_SECRET_KEY='...'   # min 16 caracteres
+./deploy-base.sh <perfil>        # 1. ECR + RDS + secretos
+./bootstrap-image.sh <perfil>    # 2. imagen inicial (despliegue manual); requiere Docker en marcha
+./deploy-fargate.sh <perfil>     # 3. ALB + Fargate + CodeDeploy; la URL sale en ApiUrl
+./deploy-ci.sh <perfil>          # 4. pipeline; autorizar la conexion GitHub si queda PENDING
+./destroy.sh <perfil> [ci|fargate|base|all]
 ```
 
-El despliegue es manual a proposito: la Entrega 2 prohibe CD. Para desplegar otra
-version se vuelve a correr `deploy-app.sh` con el hash del commit.
+Flujo: un commit a `master` dispara el pipeline -> CodeBuild corre pytest -> construye la imagen y la sube a
+ECR (tag = 8 primeros caracteres del commit) -> CodeDeploy la despliega en Fargate con blue/green y
+vuelve atras solo si la version nueva no queda sana. Si pytest falla no se construye imagen ni hay Deploy.
 
 ## Postman (`postman/`)
 

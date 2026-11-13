@@ -1,7 +1,8 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
-  Entrega 2 DevOps (CI): GitHub (master) -> CodePipeline V2 -> CodeBuild (pytest + artefacto) -> S3.
-  Sin etapa Deploy (el enunciado prohibe CD en esta entrega).
+  Entrega 3 DevOps (CI + CD): GitHub (master) -> CodePipeline V2 -> CodeBuild (pytest + imagen a ECR)
+  -> CodeDeploy (blue/green en ECS Fargate). Evoluciona el pipeline de la Entrega 2 (que no tenia Deploy).
+  Requiere base-stack.yaml y fargate-stack.yaml ya creados (deploy-ci.sh pasa sus outputs).
 
 Parameters:
   GitHubOwner:
@@ -32,6 +33,28 @@ Parameters:
     Type: Number
     Default: 14
     AllowedValues: [1, 3, 5, 7, 14, 30]
+  # ---- Outputs de base-stack.yaml y fargate-stack.yaml (los pasa deploy-ci.sh) ----
+  EcrRepositoryName:
+    Type: String
+    Default: blacklist-service
+  DBHost:
+    Type: String
+  DBSecretArn:
+    Type: String
+  TokenSecretArn:
+    Type: String
+  JwtSecretArn:
+    Type: String
+  TaskExecutionRoleArn:
+    Type: String
+  TaskRoleArn:
+    Type: String
+  CodeDeployApplicationName:
+    Type: String
+    Default: blacklist-service-cd
+  DeploymentGroupName:
+    Type: String
+    Default: blacklist-service-dg
 
 Conditions:
   CreateConnection: !Equals [!Ref ExistingConnectionArn, ""]
@@ -148,6 +171,21 @@ Resources:
                   - s3:GetBucketAcl
                   - s3:GetBucketLocation
                 Resource: !GetAtt ArtifactBucket.Arn
+              - Sid: EcrLogin
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: EcrPush
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !Sub "arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${EcrRepositoryName}"
               - Sid: TestReports
                 Effect: Allow
                 Action:
@@ -202,6 +240,34 @@ Resources:
                   - CreateConnection
                   - !GetAtt GitHubConnection.ConnectionArn
                   - !Ref ExistingConnectionArn
+              # Etapa Deploy: CodeDeployToECS registra la task definition y crea el despliegue
+              - Sid: CodeDeployToEcs
+                Effect: Allow
+                Action:
+                  - codedeploy:CreateDeployment
+                  - codedeploy:GetDeployment
+                  - codedeploy:GetDeploymentConfig
+                  - codedeploy:GetApplication
+                  - codedeploy:GetApplicationRevision
+                  - codedeploy:RegisterApplicationRevision
+                Resource: "*"
+              - Sid: EcsTaskDefinition
+                Effect: Allow
+                Action:
+                  - ecs:RegisterTaskDefinition
+                  - ecs:DescribeTaskDefinition
+                  - ecs:DescribeServices
+                  - ecs:TagResource
+                Resource: "*"
+              - Sid: PassTaskRoles
+                Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !Ref TaskExecutionRoleArn
+                  - !Ref TaskRoleArn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
 
   # --------------------------------------------------------------------------
   # CodeBuild: la fuente y la salida las maneja el pipeline.
@@ -211,7 +277,7 @@ Resources:
     DependsOn: TestReportGroup
     Properties:
       Name: !Ref ProjectName
-      Description: Instala dependencias, corre pytest y genera el artefacto desplegable.
+      Description: Corre pytest, construye la imagen del contenedor y la sube a ECR.
       ServiceRole: !GetAtt CodeBuildRole.Arn
       Source:
         Type: CODEPIPELINE
@@ -222,10 +288,26 @@ Resources:
         Type: LINUX_CONTAINER
         ComputeType: BUILD_GENERAL1_SMALL
         Image: aws/codebuild/amazonlinux-x86_64-standard:5.0
+        # Necesario para ejecutar docker build dentro de CodeBuild
+        PrivilegedMode: true
         EnvironmentVariables:
-          # buildspec.yml copia aqui builds/app-<commit>.zip (trazabilidad commit -> artefacto)
-          - Name: ARTIFACT_BUCKET
-            Value: !Ref ArtifactBucket
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: ECR_REPOSITORY_URI
+            Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepositoryName}"
+          # Datos del ambiente que buildspec.yml escribe en taskdef.json
+          - Name: DB_HOST
+            Value: !Ref DBHost
+          - Name: DB_SECRET_ARN
+            Value: !Ref DBSecretArn
+          - Name: TOKEN_SECRET_ARN
+            Value: !Ref TokenSecretArn
+          - Name: JWT_SECRET_ARN
+            Value: !Ref JwtSecretArn
+          - Name: TASK_EXECUTION_ROLE_ARN
+            Value: !Ref TaskExecutionRoleArn
+          - Name: TASK_ROLE_ARN
+            Value: !Ref TaskRoleArn
       TimeoutInMinutes: 15
       QueuedTimeoutInMinutes: 30
       LogsConfig:
@@ -234,8 +316,9 @@ Resources:
           GroupName: !Ref BuildLogGroup
 
   # --------------------------------------------------------------------------
-  # Pipeline V2: Source (GitHub) -> Build (CodeBuild). SIN Deploy.
-  # El trigger filtra push a la rama indicada (punto 4 del enunciado).
+  # Pipeline V2: Source (GitHub) -> Build (CodeBuild) -> Deploy (CodeDeploy a ECS Fargate).
+  # El trigger filtra push a la rama indicada: cada commit a master recorre las 3 etapas.
+  # Si Build falla (pruebas o docker build), Deploy no se ejecuta.
   # --------------------------------------------------------------------------
   Pipeline:
     Type: AWS::CodePipeline::Pipeline
@@ -281,6 +364,26 @@ Resources:
               InputArtifacts:
                 - Name: SourceArtifact
               OutputArtifacts:
+                - Name: BuildArtifact
+        - Name: Deploy
+          Actions:
+            - Name: DeployToFargate
+              RunOrder: 1
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CodeDeployToECS
+                Version: "1"
+              Configuration:
+                ApplicationName: !Ref CodeDeployApplicationName
+                DeploymentGroupName: !Ref DeploymentGroupName
+                TaskDefinitionTemplateArtifact: BuildArtifact
+                TaskDefinitionTemplatePath: taskdef.json
+                AppSpecTemplateArtifact: BuildArtifact
+                AppSpecTemplatePath: appspec.yaml
+                Image1ArtifactName: BuildArtifact
+                Image1ContainerName: IMAGE1_NAME
+              InputArtifacts:
                 - Name: BuildArtifact
       Triggers:
         - ProviderType: CodeStarSourceConnection
