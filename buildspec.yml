@@ -6,9 +6,11 @@
 #   JWT_SECRET_ARN, TASK_EXECUTION_ROLE_ARN, TASK_ROLE_ARN
 #
 #   install     -> Python 3.12 (imagen Amazon Linux 2023 standard:5.0).
-#   pre_build   -> dependencias + pruebas unitarias (pytest) + login a ECR.
-#                  Si pytest falla, la fase falla y NO se construye ni se sube imagen.
-#   build       -> docker build de la imagen (tag = 8 primeros caracteres del commit).
+#   pre_build   -> dependencias + login a ECR.
+#   build       -> 1) pruebas unitarias (pytest)  2) docker build (tag = 8 primeros caracteres
+#                  del commit). Si pytest falla, el docker build no se ejecuta y NO se sube
+#                  imagen. pytest corre aqui (y no en pre_build) para que CodeBuild publique
+#                  el reporte JUnit en la pestana "Reports" aunque haya pruebas fallidas.
 #   post_build  -> SOLO si todo fue bien: push a ECR, imageDetail.json y taskdef.json
 #                  con los datos del ambiente. Son los insumos de la etapa Deploy.
 #   reports     -> resultado de pytest (JUnit XML) en la pestana "Reports" de CodeBuild.
@@ -30,16 +32,17 @@ phases:
 
   pre_build:
     commands:
-      - 'echo "== PRE_BUILD: dependencias y pruebas unitarias =="'
+      - 'echo "== PRE_BUILD: dependencias =="'
       - pip install -r requirements-dev.txt
       - mkdir -p reports
-      - python -m pytest -v --junitxml=reports/junit.xml
       - 'echo "== PRE_BUILD: login a ECR =="'
       - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
       - IMAGE_TAG=$(echo "$CODEBUILD_RESOLVED_SOURCE_VERSION" | cut -c1-8)
 
   build:
     commands:
+      - 'echo "== BUILD: pruebas unitarias =="'
+      - python -m pytest -v --junitxml=reports/junit.xml
       - 'echo "== BUILD: imagen del contenedor =="'
       - docker build -t "${ECR_REPOSITORY_URI}:${IMAGE_TAG}" .
 
